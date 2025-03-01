@@ -73,6 +73,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "failed to parse media type", err)
 		return
 	}
+
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
@@ -82,6 +83,19 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	processedFileName, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not process file data", err)
+		return
+	}
+
+	processingFile, err := os.Open(processedFileName)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error opening processing file", err)
+		return
+	}
+	defer processingFile.Close()
+
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
 	if err != nil {
@@ -90,24 +104,39 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	keyString := base64.RawURLEncoding.EncodeToString(key)
-	objectKey := fmt.Sprintf("%s.mp4", keyString)
 
-	tempFile.Seek(0, io.SeekStart)
+	aspectRatio, err := getVideoAspectRatio(processingFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to get aspect ratio", err)
+		return
+	}
+
+	var prefix string
+	if aspectRatio == "16:9" {
+		prefix = "landscape"
+	} else if aspectRatio == "9:16" {
+		prefix = "portrait"
+	} else {
+		prefix = "other"
+	}
+
+	objectKey := fmt.Sprintf("%s/%s.mp4", prefix, keyString)
+
+	processingFile.Seek(0, io.SeekStart)
 	objectInput := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &objectKey,
-		Body:        tempFile,
+		Body:        processingFile,
 		ContentType: &contentType,
 	}
 
-	// fmt.Println(cfg.s3Bucket)
-	// fmt.Println("%+v", &objectInput)
 	_, err = cfg.s3Client.PutObject(r.Context(), &objectInput)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "could not save file", err)
 		return
 	}
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objectKey)
+	videoURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, objectKey)
+	fmt.Println(videoURL)
 	video.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(video)
